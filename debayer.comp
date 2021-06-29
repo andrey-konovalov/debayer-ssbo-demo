@@ -1,0 +1,183 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/*
+ * Based on the code from http://jgt.akpeters.com/papers/McGuire08/
+ *
+ * Efficient, High-Quality Bayer Demosaic Filtering on GPUs
+ *
+ * Morgan McGuire
+ *
+ * This paper appears in issue Volume 13, Number 4.
+ * ---------------------------------------------------------
+ * Copyright (c) 2008, Morgan McGuire. All rights reserved.
+ *
+ *
+ * Modified by Linaro Ltd to be used in compute shader.
+ * Copyright (C) 2021, Linaro
+ *
+ * debayer.comp - compute shader code for raw Bayer 8-bit format
+ */
+
+#version 310 es
+
+precision highp int;
+
+#define LSIZE_X 32
+#define LSIZE_Y 8
+
+layout (local_size_x = LSIZE_X, local_size_y = LSIZE_Y) in;
+
+#define UINT_SIZEOF 4
+#define PIXELS_PER_UINT 4
+
+/*
+ * 2 extra lines on top and below the local group, 1 extra word before
+ * and after each line:
+ */
+#define SHARED_SIZE_X (LSIZE_X/PIXELS_PER_UINT + 2)
+#define SHARED_SIZE_Y (LSIZE_Y + 4)
+
+layout (std430, binding = 0) buffer BufferIn {
+	uint pixels_in[];
+};
+layout (std430, binding = 1) buffer BufferOut {
+	uint pixels_out[];
+};
+
+uniform ivec2 size;
+
+const ivec2 first_red = ivec2(1, 1);
+
+uint to_rgba(int red, int green, int blue) {
+	return (uint(red) << 24) | (uint(green) << 16) | (uint(blue) << 8) \
+		| 0xFFu;
+}
+
+const ivec2 frame_size = ivec2(1920,1080);
+const int stride = 1920;
+
+shared uint img_data[SHARED_SIZE_Y * SHARED_SIZE_X];
+
+/*
+ * RAW8 case: 4 pixels per one uint word in the img_data[] buffer
+ */
+void prefetch1(ivec2 offset)
+{
+	/* local pixel coordinates - in the LSIZE_X*LSIZE_Y subwindow */
+	ivec2 loc_coord = ivec2(gl_LocalInvocationID.xy) + offset;
+
+	if (loc_coord.x % 4 != 0)
+		return;
+
+	/* calculate the index of the word to write into img_data[] */
+	int index = (loc_coord.y + 2) * SHARED_SIZE_X + (loc_coord.x + 4)/4;
+
+	ivec2 glb_coord = ivec2(gl_GlobalInvocationID.xy) + offset;
+
+	if (any(lessThan(glb_coord, ivec2(0,0))) ||
+	    any(greaterThanEqual(glb_coord, frame_size)))
+		img_data[index] = 0u; /* zero if reading outside the frame */
+	else
+		img_data[index] = pixels_in[glb_coord.y * stride / 4 + glb_coord.x / 4];
+}
+
+void prefetch(void) {
+	if (gl_LocalInvocationID.y == 0u) {
+		if (gl_LocalInvocationID.x == 0u)
+			prefetch1(ivec2(-4, -1));
+		else if (gl_LocalInvocationID.x + 1u == gl_WorkGroupSize.x)
+			prefetch1(ivec2(1, -1));
+		prefetch1(ivec2(0, -1));
+		prefetch1(ivec2(0, -2));
+	} else if (gl_LocalInvocationID.y + 1u == gl_WorkGroupSize.y) {
+		if (gl_LocalInvocationID.x == 0u)
+			prefetch1(ivec2(-4, 1));
+		else if (gl_LocalInvocationID.x + 1u == gl_WorkGroupSize.x)
+			prefetch1(ivec2(1, 1));
+		prefetch1(ivec2(0, 1));
+		prefetch1(ivec2(0, 2));
+	}
+	if (gl_LocalInvocationID.x == 0u) {
+		prefetch1(ivec2(-4, 0));
+	} else if (gl_LocalInvocationID.x + 1u == gl_WorkGroupSize.x) {
+		prefetch1(ivec2(1, 0));
+	}
+	prefetch1(ivec2(0, 0));
+}
+
+int fetch(int offset_x, int offset_y) {
+	offset_x += int(gl_LocalInvocationID.x);
+	offset_y += int(gl_LocalInvocationID.y);
+	int index = (offset_y + 2) * SHARED_SIZE_X + (offset_x + 4)/4;
+	return int((img_data[index] >> 8*(offset_x % 4)) & 0xffu);
+}
+
+void main(void) {
+	prefetch();
+
+	barrier();	/* wait for all the prefetch()es to complete */
+
+	const ivec4 kC16 = ivec4( 8,  12,  10,  10); /* kC times 16 */
+	ivec2 gpos = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 alternate = (gpos + first_red) % ivec2(2, 2);
+
+	int C = fetch(0, 0);
+	ivec4 Dvec = ivec4(fetch(-1, -1), fetch(-1, 1),
+			   fetch(1, -1), fetch(1, 1));
+	Dvec.xy += Dvec.zw;
+	Dvec.x  += Dvec.y;	/* Dvec.x += Dvec.y + Dvec.z + Dvec.w */
+
+	ivec4 PATTERN16 = (kC16.xyz * C).xyzz; /* PATTERN times 16 */
+
+	ivec4 value = ivec4(fetch(0, -2), fetch(0, -1), fetch(-2, 0),
+			    fetch(-1, 0));
+	ivec4 temp = ivec4(fetch(0, 2), fetch(0, 1), fetch(2, 0),
+			   fetch(1, 0));
+
+	const ivec4 kA16 = ivec4(-2, -3,  1, -2); /* kA times 16 */
+	const ivec4 kB16 = ivec4(4, 0, 0, 8);	/* kB times 16 */
+	const ivec4 kD16 = ivec4(0, 4, -2, -2);	/* kD times 16 */
+
+	/* Conserve constant registers and take advantage of free
+	 * swizzle on load */
+	#define kE16 (kA16.xywz)
+	#define kF16 (kB16.xywz)
+
+	value += temp;
+
+	/*
+	 * There are five filter patterns (identity, cross, checker,
+	 * theta, phi). Precompute the terms from all of them and then
+	 * use swizzles to assign to color channels.
+	 *
+	 * Channel	Matches
+	 *   x		cross   (e.g., EE G)
+	 *   y		checker (e.g., EE B)
+	 *   z		theta   (e.g., EO R)
+	 *   w		phi     (e.g., EO R)
+	 */
+	#define A (value[0])
+	#define B (value[1])
+	#define D (Dvec.x)
+	#define E (value[2])
+	#define F (value[3])
+
+	/*
+	 * Avoid zero elements. On a scalar processor this saves two
+	 * MADDs, and it has no effect on a vector processor.
+	 */
+	PATTERN16.yzw += (kD16.yz * D).xyy;
+	PATTERN16 += (kA16.xyz * A).xyzx + (kE16.xyw * E).xyxz;
+	PATTERN16.xw += kB16.xw * B;
+	PATTERN16.xz += kF16.xz * F;
+	ivec4 PATTERN = PATTERN16 / 16;
+
+	int i = gpos.y * int(gl_NumWorkGroups.x*gl_WorkGroupSize.x) + gpos.x;
+
+	pixels_out[i] = (alternate.y == 0) ?
+		((alternate.x == 0) ?
+			to_rgba(C, PATTERN.x, PATTERN.y) :
+			to_rgba(PATTERN.z, C, PATTERN.w)) :
+		((alternate.x == 0) ?
+			to_rgba(PATTERN.w, C, PATTERN.z) :
+			to_rgba(PATTERN.y, PATTERN.x, C));
+}
